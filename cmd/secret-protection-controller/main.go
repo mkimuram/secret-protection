@@ -26,6 +26,7 @@ import (
 	"github.com/mkimuram/secret-protection/pkg/secretprotection"
 	coreinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
@@ -62,6 +63,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	metadataClient, err := metadata.NewForConfig(config)
+	if err != nil {
+		klog.Error(err.Error())
+		os.Exit(1)
+	}
+
 	// Pass a context with a timeout
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -70,7 +77,7 @@ func main() {
 
 	stopCh := make(chan struct{})
 
-	if err := startSecretProtectionController(ctx, coreFactory, kubeClient, *enablePvcEvent, stopCh); err != nil {
+	if err := startSecretProtectionController(ctx, coreFactory, kubeClient, metadataClient, *enablePvcEvent, stopCh); err != nil {
 		klog.Error(err.Error())
 		os.Exit(1)
 	}
@@ -88,7 +95,7 @@ func buildConfig(kubeconfig string) (*rest.Config, error) {
 	return rest.InClusterConfig()
 }
 
-func startSecretProtectionController(ctx context.Context, coreFactory coreinformers.SharedInformerFactory, kubeClient kubernetes.Interface, enablePvcEvent bool, stopCh <-chan struct{}) error {
+func startSecretProtectionController(ctx context.Context, coreFactory coreinformers.SharedInformerFactory, kubeClient kubernetes.Interface, metadataClient metadata.Interface, enablePvcEvent bool, stopCh <-chan struct{}) error {
 	go secretprotection.NewSecretProtectionController(
 		coreFactory.Core().V1().Secrets(),
 		coreFactory.Core().V1().Pods(),
@@ -96,6 +103,7 @@ func startSecretProtectionController(ctx context.Context, coreFactory coreinform
 		coreFactory.Core().V1().PersistentVolumeClaims(),
 		coreFactory.Storage().V1().StorageClasses(),
 		kubeClient,
+		metadataClient,
 		enablePvcEvent,
 	).Run(1, stopCh)
 	coreFactory.Start(stopCh)
