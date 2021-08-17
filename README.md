@@ -1,26 +1,51 @@
 # secret-protection
 
 ## Overview
-The secret-protection controller is an external controller that monitors Secret objects and their referencing objects and blocks deletion of Secrets while they are in-use. KEP for this feature can be found [here](https://github.com/kubernetes/enhancements/pull/2640).
-In this branch, protection logic is experimentally delegated to [in-use protector](https://github.com/mkimuram/inuseprotection).
-In-use protector adds and removes `k8s.io/in-use-protection` finalizer according to the useeReference.
-It adds the finalizer to an object if other objects reference it via useeReference, and removes the finalizer if no object references it.
-Secret-protection controller just upates the useeReference.
+The secret-protection controller is an external controller that monitors Secret objects and their referencing objects and blocks deletion of Secrets while they are in-use. This feature is being discussd in [KEP-2639](https://github.com/kubernetes/enhancements/pull/2640).
+In this branch, protection logic is experimentally delegated to Lien that is being discussed in [KEP-2839](https://github.com/kubernetes/enhancements/pull/2840) and prototyped [here](https://github.com/mkimuram/kubernetes/commits/lien).
+
+In Lien, a new field `Liens` is introduced in Object's Metadata as a slice of strings, like `Finalizers`.
+Users or controllers can add/remove the field to ask to block the deletion request of the object.
+The deletion request to an object is blocked by lien validating admission webhook, until the last `Liens` of the object is deleted.
+
+By using the Lien, secret-protection controller provides a protection mechanism for secrets.
+It upates the `Liens` field of secrets when it has a referencing object.
+`Liens` field is added/removed per referencing object basis, like `kubernetes.io/secret-protection v1/Pod/default/secret-test-pod`.
 
 ## Feature status
 This project is still pre-alpha. This is just a prototype for discussion purpose.
 
 ## Usage
 ### Prerequisite
-In-use protector is deployed.
+A cluster with Lien is deployed.
+
+```bash
+git clone --single-branch --depth 5 --branch lien https://github.com/mkimuram/kubernetes.git
+cd kubernetes/
+ENABLE_ADMISSION_PLUGINS=Lien hack/local-up-cluster.sh
+```
 
 ### Build container 
+- Clone this branch
+```bash
+git clone --single-branch --branch lien https://github.com/mkimuram/secret-protection.git
+cd secret-protection/
 ```
+
+- Update go.mod to use the version of k8s.io/apimachinery in the above k8s repo
+```bash
+k8ssrc=~/work/kubernetes
+go mod edit -replace k8s.io/apimachinery=${k8ssrc}/staging/src/k8s.io/apimachinery/
+go mod tidy
+```
+
+- Build the secret protection controller container
+```bash
 make container-secret-protection-controller
 ```
 
 ### Deploy 
-(Above container image needs to be available before below command, such as by running `kind load docker-image`.)
+(Above container image needs to be available before below command. Note that k8s cluster deployed by local-up-cluster.sh satisfies this requirement.)
 ```
 kubectl create -f examples/kubernetes/secret-protection-controller/rbac-secret-protection-controller.yaml
 kubectl create -f examples/kubernetes/secret-protection-controller/setup-secret-protection-controller.yaml
@@ -32,7 +57,7 @@ kubectl delete -f examples/kubernetes/secret-protection-controller/setup-secret-
 kubectl delete -f examples/kubernetes/secret-protection-controller/rbac-secret-protection-controller.yaml
 ```
 
-While this controller is deployed, `kubernetes.io/secret-protection` finalizers are added to all secrets, these finalizers are needed to be manually deleted after the controller is undeployed.
+While this controller is deployed, Liens that are prefixed with `kubernetes.io/secret-protection` are added to the secrets that are used by other resources, these Liens are needed to be manually deleted after the controller is undeployed.
 
 ## How to test manually
 ### [Unused case]
@@ -40,7 +65,8 @@ It should be deleted immediately.
 
 ```
 kubectl create secret generic test-secret --from-literal='username=my-app' --from-literal='password=39528$vdg7Jb'
-kubectl get secret test-secret -o yaml
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+
 kubectl delete secret test-secret
 ```
 
@@ -51,19 +77,21 @@ It should block deletion of secret until all pods using the secret are deleted.
 kubectl create secret generic test-secret --from-literal='username=my-app' --from-literal='password=39528$vdg7Jb'
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/website/master/content/en/examples/pods/inject/secret-pod.yaml
 kubectl describe pod secret-test-pod
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+[kubernetes.io/secret-protection v1/Pod/default/secret-test-pod]
 kubectl delete secret test-secret
-kubectl get secret test-secret -o yaml
+Error from server (Forbidden): secrets "test-secret" is forbidden: deletion not allowed by liens
 kubectl delete pod secret-test-pod
-kubectl get secret
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+
+kubectl delete secret test-secret
+secret "test-secret" deleted
 ```
 
 ### [Used by CSI PV case]
 
-~~It should block deletion of secret until all PVs using the secret are deleted.
-(Below assumes that csi-hostpath driver has already been installed.)~~
-
-> **_NOTE:_** Due to the lack of ability to track reference across namespaces, this case doesn't work well with this implementation(The [version](https://github.com/mkimuram/inuseprotection) without in-use protection works).
-It will be technically possible to enable it, however it won't align with garbage collector's behavior (please see Note in [this section](https://kubernetes.io/docs/concepts/workloads/controllers/garbage-collection/#owners-and-dependents)).
+It should block deletion of secret until all PVs using the secret are deleted.
+(Below assumes that csi-hostpath driver has already been installed.)
 
 ```
 kubectl create secret generic test-secret --from-literal='username=my-app' --from-literal='password=39528$vdg7Jb'
@@ -101,9 +129,16 @@ kubectl get pv -o yaml | grep -A 5 " csi:"
         namespace: default
       volumeAttributes:
 
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+[kubernetes.io/secret-protection v1/PersistentVolume//pvc-b51b463a-fafe-4e78-a11a-b62d670b0916]
+
 kubectl delete secret test-secret
-kubectl get secret
+Error from server (Forbidden): secrets "test-secret" is forbidden: deletion not allowed by liens
+
 kubectl delete pvc test-pv-claim
-kubectl get secret
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+
+kubectl delete secret test-secret
+secret "test-secret" deleted
 ```
 
