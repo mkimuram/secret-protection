@@ -24,12 +24,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mkimuram/secret-protection/pkg/secretprotection/util/graph"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,8 +50,13 @@ import (
 )
 
 const (
-	// SecretProtectionFinalizer is the name of finalizer on secrets that are consumed by the other resources
-	SecretProtectionLienID                  = "kubernetes.io/secret-protection"
+	// SecretProtectionLienID is the name of lien on secrets that are consumed by the other resources
+	SecretProtectionLienID = "kubernetes.io/secret-protection"
+	// EnableProtectionAnnotation is the name of annotation on secrets that needs lien to be added
+	EnableProtectionAnnotation = "kubernetes.io/enable-secret-protection"
+	// ProtectionEnable is the annotation key that enables protection
+	ProtectionEnable = "yes"
+
 	deprecatedProvisionerSecretNameKey      = "provisioner-secret-name"
 	deprecatedProvisionerSecretNamespaceKey = "provisioner-secret-namespace"
 	provisionerSecretNameKey                = "csi.storage.k8s.io/provisioner-secret-name"
@@ -61,7 +66,13 @@ const (
 	tokenPVCNameKey      = "pvc.name"
 	tokenPVCNamespaceKey = "pvc.namespace"
 
-	useeReferenceKey = "k8s.io/useereference"
+	createEvent = "create"
+	updateEvent = "update"
+	deleteEvent = "delete"
+
+	podResource    = "pod"
+	pvResource     = "pv"
+	secretResource = "secret"
 )
 
 // Controller is controller that removes SecretProtectionFinalizer
@@ -69,6 +80,8 @@ const (
 type Controller struct {
 	client         clientset.Interface
 	metadataClient metadata.Interface
+
+	resources *graph.NodeMap
 
 	secretLister       corelisters.SecretLister
 	secretListerSynced cache.InformerSynced
@@ -85,10 +98,9 @@ type Controller struct {
 	scLister       storageListers.StorageClassLister
 	scListerSynced cache.InformerSynced
 
-	podQueue       workqueue.RateLimitingInterface
-	pvQueue        workqueue.RateLimitingInterface
-	podDeleteQueue workqueue.RateLimitingInterface
-	pvDeleteQueue  workqueue.RateLimitingInterface
+	graphQueue      workqueue.RateLimitingInterface
+	addLienQueue    workqueue.RateLimitingInterface
+	deleteLienQueue workqueue.RateLimitingInterface
 
 	// allows overriding of StorageObjectInUseProtection feature Enabled/Disabled for testing
 	storageObjectInUseProtectionEnabled bool
@@ -99,10 +111,10 @@ func NewSecretProtectionController(secretInformer coreinformers.SecretInformer, 
 	e := &Controller{
 		client:                              cl,
 		metadataClient:                      metadataCl,
-		podQueue:                            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secretprotection_pod"),
-		pvQueue:                             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secretprotection_pv"),
-		podDeleteQueue:                      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secretprotection_pod_delete"),
-		pvDeleteQueue:                       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secretprotection_pv_delete"),
+		resources:                           graph.NewNodeMap(),
+		graphQueue:                          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secretprotection_graph"),
+		addLienQueue:                        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secretprotection_add_lien"),
+		deleteLienQueue:                     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secretprotection_delete_lien"),
 		storageObjectInUseProtectionEnabled: storageObjectInUseProtectionFeatureEnabled,
 	}
 	if cl != nil && cl.CoreV1().RESTClient().GetRateLimiter() != nil {
@@ -111,25 +123,41 @@ func NewSecretProtectionController(secretInformer coreinformers.SecretInformer, 
 
 	e.secretLister = secretInformer.Lister()
 	e.secretListerSynced = secretInformer.Informer().HasSynced
+	secretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			e.handlerFunc(createEvent, secretResource, obj)
+		},
+		UpdateFunc: func(old, new interface{}) {
+			e.handlerFunc(updateEvent, secretResource, new)
+		},
+	})
 
 	e.podLister = podInformer.Lister()
 	e.podListerSynced = podInformer.Informer().HasSynced
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: e.podAddedUpdated,
-		UpdateFunc: func(old, new interface{}) {
-			e.podAddedUpdated(new)
+		AddFunc: func(obj interface{}) {
+			e.handlerFunc(createEvent, podResource, obj)
 		},
-		DeleteFunc: e.podDeleted,
+		UpdateFunc: func(old, new interface{}) {
+			e.handlerFunc(updateEvent, podResource, new)
+		},
+		DeleteFunc: func(obj interface{}) {
+			e.handlerFunc(deleteEvent, podResource, obj)
+		},
 	})
 
 	e.pvLister = pvInformer.Lister()
 	e.pvListerSynced = pvInformer.Informer().HasSynced
 	pvInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: e.pvAddedUpdated,
-		UpdateFunc: func(old, new interface{}) {
-			e.pvAddedUpdated(new)
+		AddFunc: func(obj interface{}) {
+			e.handlerFunc(createEvent, pvResource, obj)
 		},
-		DeleteFunc: e.pvDeleted,
+		UpdateFunc: func(old, new interface{}) {
+			e.handlerFunc(updateEvent, pvResource, new)
+		},
+		DeleteFunc: func(obj interface{}) {
+			e.handlerFunc(deleteEvent, pvResource, obj)
+		},
 	})
 
 	e.pvcLister = pvcInformer.Lister()
@@ -144,10 +172,9 @@ func NewSecretProtectionController(secretInformer coreinformers.SecretInformer, 
 // Run runs the controller goroutines.
 func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
-	defer c.podQueue.ShutDown()
-	defer c.pvQueue.ShutDown()
-	defer c.podDeleteQueue.ShutDown()
-	defer c.pvDeleteQueue.ShutDown()
+	defer c.graphQueue.ShutDown()
+	defer c.addLienQueue.ShutDown()
+	defer c.deleteLienQueue.ShutDown()
 
 	klog.InfoS("Starting secret protection controller")
 	defer klog.InfoS("Shutting down secret protection controller")
@@ -156,389 +183,425 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 		return
 	}
 
+	// GraphWorker should be singleton
+	go wait.Until(c.runGraphWorker, time.Second, stopCh)
+
 	for i := 0; i < workers; i++ {
-		go wait.Until(c.runPodWorker, time.Second, stopCh)
-		go wait.Until(c.runPvWorker, time.Second, stopCh)
-		go wait.Until(c.runPodDeleteWorker, time.Second, stopCh)
-		go wait.Until(c.runPvDeleteWorker, time.Second, stopCh)
+		go wait.Until(c.runAddLienWorker, time.Second, stopCh)
+		go wait.Until(c.runDeleteLienWorker, time.Second, stopCh)
 	}
 
 	<-stopCh
 }
 
-func (c *Controller) runPodWorker() {
-	for c.processNextPodWorkItem() {
+func (c *Controller) runGraphWorker() {
+	for c.processNextGraphWorkItem() {
 	}
 }
 
-// processNextPodWorkItem deals with one podKey off the queue.  It returns false when it's time to quit.
-func (c *Controller) processNextPodWorkItem() bool {
-	podKey, quit := c.podQueue.Get()
+// processNextGraphWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+func (c *Controller) processNextGraphWorkItem() bool {
+	key, quit := c.graphQueue.Get()
 	if quit {
 		return false
 	}
-	defer c.podQueue.Done(podKey)
+	defer c.graphQueue.Done(key)
 
-	podNamespace, podName, err := cache.SplitMetaNamespaceKey(podKey.(string))
+	operation, resourceType, namespace, name, err := splitHandlerKey(key.(string))
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("error parsing pod key %q: %v", podKey, err))
+		utilruntime.HandleError(fmt.Errorf("error parsing key %q: %v", key, err))
 		return true
 	}
 
-	err = c.processPod(podNamespace, podName)
-	if err == nil {
-		c.podQueue.Forget(podKey)
+	err = c.processGraph(operation, resourceType, namespace, name)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("key %v failed with : %v", key, err))
+		c.graphQueue.AddRateLimited(key)
 		return true
 	}
 
-	utilruntime.HandleError(fmt.Errorf("pod %v failed with : %v", podKey, err))
-	c.podQueue.AddRateLimited(podKey)
-
+	c.graphQueue.Forget(key)
 	return true
 }
 
-func (c *Controller) processPod(podNamespace, podName string) error {
-	klog.V(4).InfoS("Processing pod", "pod", klog.KRef(podNamespace, podName))
+func (c *Controller) processGraph(operation, resourceType, namespace, name string) error {
+	klog.V(4).InfoS("Processing graph", resourceType, klog.KRef(namespace, name))
 	startTime := time.Now()
 	defer func() {
-		klog.V(4).InfoS("Finished processing pod", "pod", klog.KRef(podNamespace, podName), "duration", time.Since(startTime))
+		klog.V(4).InfoS("Finished processing graph", resourceType, klog.KRef(namespace, name), "duration", time.Since(startTime))
 	}()
 
-	pod, err := c.podLister.Pods(podNamespace).Get(podName)
+	switch operation {
+	case createEvent, updateEvent:
+		switch resourceType {
+		case podResource:
+			return c.processPodCreateUpdate(namespace, name)
+		case pvResource:
+			return c.processPvCreateUpdate(name)
+		case secretResource:
+			return c.processSecretCreateUpdate(namespace, name)
+		default:
+			klog.V(4).InfoS("Unknown resourceType specified, ignoring", "resourceType", resourceType)
+			return nil
+		}
+	case deleteEvent:
+		switch resourceType {
+		case podResource, pvResource, secretResource:
+			return c.processDelete(resourceType, namespace, name)
+		default:
+			klog.V(4).InfoS("Unknown resourceType specified, ignoring", "resourceType", resourceType)
+			return nil
+		}
+	default:
+		klog.V(4).InfoS("Unknown operation specified, ignoring", "operation", operation)
+		return nil
+	}
+
+	return nil
+}
+
+func (c *Controller) processPodCreateUpdate(namespace, name string) error {
+	pod, err := c.podLister.Pods(namespace).Get(name)
 	if apierrors.IsNotFound(err) {
-		klog.V(4).InfoS("Pod not found, ignoring", "pod", klog.KRef(podNamespace, podName))
+		klog.V(4).InfoS("Pod not found, ignoring", "pod", klog.KRef(namespace, name))
 		return nil
 	}
 	if err != nil {
 		return err
 	}
 
+	podKey := graph.NewObjectKey(podResource, namespace, name)
+	c.resources.EnsureNode(podKey)
+
+	usedSecrets := map[graph.ObjectKey]bool{}
 	// Find secrets used by this Pod
-	hasErr := false
-	resourceID := toPodResourceID(pod.Namespace, pod.Name)
 	for _, volume := range pod.Spec.Volumes {
 		switch {
 		case volume.Secret != nil:
-			secret, err := c.secretLister.Secrets(pod.Namespace).Get(volume.Secret.SecretName)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					klog.V(4).InfoS("Secret not found", "secret", klog.KRef(pod.Namespace, volume.Secret.SecretName))
-				}
-				hasErr = true
-				continue
-			}
-
-			if err := c.updateLiensForSecret(secret, resourceID); err != nil {
-				hasErr = true
-			}
+			key := graph.NewObjectKey(secretResource, namespace, volume.Secret.SecretName)
+			usedSecrets[key] = true
+			c.resources.EnsureNode(key)
 		}
 	}
 
-	// There are errors in adding Liens to any of the secrets, so return error to retry later.
-	if hasErr {
-		return fmt.Errorf("error adding liens for secrets used by Pod %s/%s", podNamespace, podName)
+	// Compare with existing graph and update changes if needed
+	deleted, added := c.resources.DiffTo(podKey, usedSecrets)
+
+	// No changes with this update
+	if len(deleted) == 0 && len(added) == 0 {
+		return nil
+	}
+
+	// Delete deleted edges
+	for key := range deleted {
+		c.resources.DeleteEdge(podKey, key)
+		if c.resources.GetNodeFromCount(key) == 0 {
+			// delete lien
+			c.deleteLienQueue.Add(key)
+		}
+	}
+
+	// Add added edges
+	for key := range added {
+		c.resources.AddEdge(podKey, key)
+		if c.resources.GetNodeFromCount(key) > 0 {
+			// add lien
+			c.addLienQueue.Add(key)
+		}
 	}
 
 	return nil
 }
 
-func (c *Controller) runPvWorker() {
-	for c.processNextPvWorkItem() {
-	}
-}
-
-// processNextPvWorkItem deals with one pvKey off the queue.  It returns false when it's time to quit.
-func (c *Controller) processNextPvWorkItem() bool {
-	pvKey, quit := c.pvQueue.Get()
-	if quit {
-		return false
-	}
-	defer c.pvQueue.Done(pvKey)
-
-	pvNamespace, pvName, err := cache.SplitMetaNamespaceKey(pvKey.(string))
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("error parsing pv key %q: %v", pvKey, err))
-		return true
-	}
-
-	err = c.processPv(pvNamespace, pvName)
-	if err == nil {
-		c.pvQueue.Forget(pvKey)
-		return true
-	}
-
-	utilruntime.HandleError(fmt.Errorf("pv %v failed with : %v", pvKey, err))
-	c.pvQueue.AddRateLimited(pvKey)
-
-	return true
-}
-
-func (c *Controller) processPv(pvNamespace, pvName string) error {
-	klog.V(4).InfoS("Processing pv", "pv", klog.KRef(pvNamespace, pvName))
-	startTime := time.Now()
-	defer func() {
-		klog.V(4).InfoS("Finished processing pv", "pv", klog.KRef(pvNamespace, pvName), "duration", time.Since(startTime))
-	}()
-
-	pv, err := c.pvLister.Get(pvName)
+func (c *Controller) processPvCreateUpdate(name string) error {
+	pv, err := c.pvLister.Get(name)
 	if apierrors.IsNotFound(err) {
-		klog.V(4).InfoS("Pv not found, ignoring", "pv", klog.KRef(pvNamespace, pvName))
+		klog.V(4).InfoS("PV not found, ignoring", "pv", klog.KRef("", name))
 		return nil
 	}
 	if err != nil {
 		return err
 	}
 
+	pvKey := graph.NewObjectKey(pvResource, "", name)
+	c.resources.EnsureNode(pvKey)
+
+	usedSecrets := map[graph.ObjectKey]bool{}
 	// Find secrets used by this PV
-	hasErr := false
-	resourceID := toPvResourceID(pv.Name)
-
 	for _, key := range c.getSecretsUsedByPV(pv) {
-		secretNamespace, secretName, err := cache.SplitMetaNamespaceKey(key)
-		if err != nil {
-			utilruntime.HandleError(fmt.Errorf("error parsing secret key %q: %v", key, err))
-			hasErr = true
-			continue
-		}
-		secret, err := c.secretLister.Secrets(secretNamespace).Get(secretName)
+		usedSecrets[key] = true
+	}
 
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				klog.V(4).InfoS("Secret not found", "secret", klog.KRef(secretNamespace, secretName))
-			}
-			hasErr = true
-			continue
-		}
+	// Compare with existing graph and update changes if needed
+	deleted, added := c.resources.DiffTo(pvKey, usedSecrets)
 
-		if err := c.updateLiensForSecret(secret, resourceID); err != nil {
-			hasErr = true
+	// No changes with this update
+	if len(deleted) == 0 && len(added) == 0 {
+		return nil
+	}
+
+	// Delete deleted edges
+	for key := range deleted {
+		c.resources.DeleteEdge(pvKey, key)
+		if c.resources.GetNodeFromCount(key) == 0 {
+			// delete lien
+			c.deleteLienQueue.Add(key)
 		}
 	}
 
-	// There are errors in adding Liens to any of the secrets, so return error to retry later.
-	if hasErr {
-		return fmt.Errorf("error adding liens for secrets used by PersistentVolume %s", pvName)
+	// Add added edges
+	for key := range added {
+		c.resources.AddEdge(pvKey, key)
+		if c.resources.GetNodeFromCount(key) > 0 {
+			// add lien
+			c.addLienQueue.Add(key)
+		}
 	}
 
 	return nil
 }
 
-func (c *Controller) runPodDeleteWorker() {
-	for c.processNextPodDeleteWorkItem() {
-	}
-}
-
-// processNextPodDeleteWorkItem deals with one podKey off the queue.  It returns false when it's time to quit.
-func (c *Controller) processNextPodDeleteWorkItem() bool {
-	podKey, quit := c.podDeleteQueue.Get()
-	if quit {
-		return false
-	}
-	defer c.podDeleteQueue.Done(podKey)
-
-	podNamespace, podName, err := cache.SplitMetaNamespaceKey(podKey.(string))
+func checkSecretMeta(secret *v1.Secret) (bool, bool, error) {
+	accessor, err := meta.Accessor(secret)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("error parsing pod key %q: %v", podKey, err))
-		return true
+		return false, false, err
 	}
 
-	err = c.processPodDelete(podNamespace, podName)
-	if err == nil {
-		c.podDeleteQueue.Forget(podKey)
-		return true
+	hasAnnon := false
+	for key, val := range accessor.GetAnnotations() {
+		if key == EnableProtectionAnnotation && val == ProtectionEnable {
+			hasAnnon = true
+		}
 	}
 
-	utilruntime.HandleError(fmt.Errorf("pod %v delete event failed with : %v", podKey, err))
-	c.podDeleteQueue.AddRateLimited(podKey)
+	hasLien := false
+	for _, lien := range accessor.GetLiens() {
+		if lien == SecretProtectionLienID {
+			hasLien = true
+		}
+	}
 
-	return true
+	return hasAnnon, hasLien, nil
 }
 
-func (c *Controller) processPodDelete(podNamespace, podName string) error {
-	klog.V(4).InfoS("Processing pod delete", "pod", klog.KRef(podNamespace, podName))
-	startTime := time.Now()
-	defer func() {
-		klog.V(4).InfoS("Finished processing pod delete", "pod", klog.KRef(podNamespace, podName), "duration", time.Since(startTime))
-	}()
-
-	// Find secrets that is used by this Pod, and remove Liens
-	secrets, err := c.secretLister.List(labels.NewSelector())
+func (c *Controller) processSecretCreateUpdate(namespace, name string) error {
+	secret, err := c.secretLister.Secrets(namespace).Get(name)
+	if apierrors.IsNotFound(err) {
+		klog.V(4).InfoS("Secret not found, ignoring", "secret", klog.KRef(namespace, name))
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 
-	resourceID := toPodResourceID(podNamespace, podName)
-	hasErr := false
+	secretKey := graph.NewObjectKey(secretResource, namespace, name)
 
-	for _, secret := range secrets {
-		err := c.deleteLiensForSecret(secret, resourceID)
-		if err != nil {
-			hasErr = true
-		}
-	}
-
-	// There are errors in deleting Liens to any of the secrets, so return error to retry later.
-	if hasErr {
-		return fmt.Errorf("error deleting liens for secrets used by Pod %s/%s", podNamespace, podName)
-	}
-
-	return nil
-}
-
-func (c *Controller) runPvDeleteWorker() {
-	for c.processNextPvDeleteWorkItem() {
-	}
-}
-
-// processNextPvDeleteWorkItem deals with one pvKey off the queue.  It returns false when it's time to quit.
-func (c *Controller) processNextPvDeleteWorkItem() bool {
-	pvKey, quit := c.pvDeleteQueue.Get()
-	if quit {
-		return false
-	}
-	defer c.pvDeleteQueue.Done(pvKey)
-
-	pvNamespace, pvName, err := cache.SplitMetaNamespaceKey(pvKey.(string))
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("error parsing pv key %q: %v", pvKey, err))
-		return true
-	}
-
-	err = c.processPvDelete(pvNamespace, pvName)
-	if err == nil {
-		c.pvDeleteQueue.Forget(pvKey)
-		return true
-	}
-
-	utilruntime.HandleError(fmt.Errorf("pv %v delete event failed with : %v", pvKey, err))
-	c.pvDeleteQueue.AddRateLimited(pvKey)
-
-	return true
-}
-
-func (c *Controller) processPvDelete(pvNamespace, pvName string) error {
-	klog.V(4).InfoS("Processing pv delete", "pv", klog.KRef(pvNamespace, pvName))
-	startTime := time.Now()
-	defer func() {
-		klog.V(4).InfoS("Finished processing pv delete", "pv", klog.KRef(pvNamespace, pvName), "duration", time.Since(startTime))
-	}()
-
-	// Find secrets that is used by this Pv, and remove Liens
-	secrets, err := c.secretLister.List(labels.NewSelector())
+	// Update liens if needed
+	hasAnnon, hasLien, err := checkSecretMeta(secret)
 	if err != nil {
 		return err
 	}
 
-	resourceID := toPvResourceID(pvName)
-	hasErr := false
-
-	for _, secret := range secrets {
-		err := c.deleteLiensForSecret(secret, resourceID)
-		if err != nil {
-			hasErr = true
+	if hasAnnon {
+		// annotation but doesn't have lien and has references
+		if !hasLien && c.resources.GetNodeFromCount(secretKey) > 0 {
+			// add lien
+			c.addLienQueue.Add(secretKey)
 		}
-	}
-
-	// There are errors in deleting Liens to any of the secrets, so return error to retry later.
-	if hasErr {
-		return fmt.Errorf("error deleting liens for secrets used by Pv %s", pvName)
+	} else {
+		// no annotation but has lien
+		if hasLien {
+			c.deleteLienQueue.Add(secretKey)
+		}
 	}
 
 	return nil
 }
 
-// podAddedUpdated reacts to Pod events
-func (c *Controller) podAddedUpdated(obj interface{}) {
-	pod, ok := obj.(*v1.Pod)
-	if !ok {
-		utilruntime.HandleError(fmt.Errorf("pod informer returned non-pod object: %#v", obj))
-		return
-	}
-	key, err := cache.MetaNamespaceKeyFunc(pod)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for pod %#v: %v", pod, err))
-		return
-	}
-	klog.V(4).InfoS("Got event on pod", key)
+func (c *Controller) processDelete(resourceType, namespace, name string) error {
+	resourceKey := graph.NewObjectKey(resourceType, namespace, name)
 
-	c.podQueue.Add(key)
+	// Compare with existing graph and empty key
+	deleted, _ := c.resources.DiffTo(resourceKey, map[graph.ObjectKey]bool{})
+
+	// Delete deleted edges
+	for key := range deleted {
+		c.resources.DeleteEdge(resourceKey, key)
+		if c.resources.GetNodeFromCount(key) == 0 {
+			// delete lien
+			c.deleteLienQueue.Add(key)
+		}
+	}
+
+	return c.resources.DeleteNodeWithoutEdge(resourceKey)
 }
 
-// podDeleted reacts to Pod deleted events
-func (c *Controller) podDeleted(obj interface{}) {
-	pod, ok := obj.(*v1.Pod)
-	if !ok {
-		utilruntime.HandleError(fmt.Errorf("pod informer returned non-pod object: %#v", obj))
-		return
+func (c *Controller) runAddLienWorker() {
+	for c.processNextAddLienWorkItem() {
 	}
-	key, err := cache.MetaNamespaceKeyFunc(pod)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for pod %#v: %v", pod, err))
-		return
-	}
-	klog.V(4).InfoS("Got delete event on pod", key)
-
-	c.podDeleteQueue.Add(key)
 }
 
-// pvDeleted reacts to PV delete events
-func (c *Controller) pvDeleted(obj interface{}) {
-	pv, ok := obj.(*v1.PersistentVolume)
-	if !ok {
-		utilruntime.HandleError(fmt.Errorf("pv informer returned non-pv object: %#v", obj))
-		return
+// processNextAddLienWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+func (c *Controller) processNextAddLienWorkItem() bool {
+	key, quit := c.addLienQueue.Get()
+	if quit {
+		return false
 	}
-	key, err := cache.MetaNamespaceKeyFunc(pv)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for pv %#v: %v", pv, err))
-		return
-	}
-	klog.V(4).InfoS("Got delete event on pv", key)
+	defer c.addLienQueue.Done(key)
 
-	c.pvDeleteQueue.Add(key)
+	objKey, ok := key.(graph.ObjectKey)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("error parsing key %q", key))
+		return true
+	}
+
+	if objKey.ResourceType != secretResource {
+		utilruntime.HandleError(fmt.Errorf("invalid resource type %q", objKey.ResourceType))
+		return true
+	}
+
+	secret, err := c.secretLister.Secrets(objKey.Namespace).Get(objKey.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			utilruntime.HandleError(fmt.Errorf("secret %v not found", key))
+		}
+		c.addLienQueue.AddRateLimited(key)
+		return true
+	}
+
+	// Update liens if needed
+	hasAnnon, hasLien, err := checkSecretMeta(secret)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("failed to check metadata for %q: %v", objKey.ResourceType, err))
+		c.addLienQueue.AddRateLimited(key)
+		return true
+	}
+
+	if hasAnnon && !hasLien {
+		err := c.addLiensForSecret(secret)
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("secret %v failed with : %v", key, err))
+			c.addLienQueue.AddRateLimited(key)
+			return true
+		}
+	}
+
+	c.addLienQueue.Forget(key)
+	return true
 }
 
-// pvAddedUpdated reacts to PV events
-func (c *Controller) pvAddedUpdated(obj interface{}) {
-	pv, ok := obj.(*v1.PersistentVolume)
-	if !ok {
-		utilruntime.HandleError(fmt.Errorf("pv informer returned non-pv object: %#v", obj))
-		return
+func (c *Controller) runDeleteLienWorker() {
+	for c.processNextDeleteLienWorkItem() {
 	}
-	key, err := cache.MetaNamespaceKeyFunc(pv)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for pv %#v: %v", pv, err))
-		return
-	}
-	klog.V(4).InfoS("Got event on pv", key)
-
-	c.pvQueue.Add(key)
 }
 
-func (c *Controller) getSecretsUsedByPV(pv *v1.PersistentVolume) []string {
-	secretKeys := []string{}
+// processNextDeleteLienWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+func (c *Controller) processNextDeleteLienWorkItem() bool {
+	key, quit := c.deleteLienQueue.Get()
+	if quit {
+		return false
+	}
+	defer c.deleteLienQueue.Done(key)
+
+	objKey, ok := key.(graph.ObjectKey)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("error parsing key %q", key))
+		return true
+	}
+
+	if objKey.ResourceType != secretResource {
+		utilruntime.HandleError(fmt.Errorf("invalid resource type %q", objKey.ResourceType))
+		return true
+	}
+
+	secret, err := c.secretLister.Secrets(objKey.Namespace).Get(objKey.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			utilruntime.HandleError(fmt.Errorf("secret %v not found", key))
+			return true
+		}
+
+		utilruntime.HandleError(fmt.Errorf("error getting secret %q: %v", key, err))
+		c.deleteLienQueue.AddRateLimited(key)
+		return true
+	}
+
+	hasAnnon, hasLien, err := checkSecretMeta(secret)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("failed to check metadata for %q: %v", objKey.ResourceType, err))
+		c.addLienQueue.AddRateLimited(key)
+		return true
+	}
+
+	if hasLien {
+		if hasAnnon {
+			// TODO: Check if secret is actually not used by any resources
+
+		}
+
+		err := c.deleteLiensForSecret(secret)
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("secret %v failed with : %v", key, err))
+			c.deleteLienQueue.AddRateLimited(key)
+			return true
+		}
+	}
+
+	c.deleteLienQueue.Forget(key)
+	return true
+}
+
+func toHandlerKey(operation, resourceType, namesapce, name string) string {
+	return fmt.Sprintf("%s/%s/%s/%s", operation, resourceType, namesapce, name)
+}
+
+func splitHandlerKey(key string) (string, string, string, string, error) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 4 {
+		return "", "", "", "", fmt.Errorf("unexpected key format: %q", key)
+	}
+
+	return parts[0], parts[1], parts[2], parts[3], nil
+}
+
+// handlerFunc reacts to events
+func (c *Controller) handlerFunc(operation, resourceType string, obj interface{}) {
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("informer returned object that can't access via accessor: %#v", obj))
+		return
+	}
+
+	klog.V(4).InfoS("Got %s event on %s %s/%s", operation, resourceType, acc.GetNamespace(), acc.GetName())
+	key := toHandlerKey(operation, resourceType, acc.GetNamespace(), acc.GetName())
+
+	c.graphQueue.Add(key)
+}
+
+func (c *Controller) getSecretsUsedByPV(pv *v1.PersistentVolume) []graph.ObjectKey {
+	secretKeys := []graph.ObjectKey{}
 
 	switch {
 	case pv.Spec.PersistentVolumeSource.CSI != nil:
 		csi := pv.Spec.PersistentVolumeSource.CSI
 
 		if csi.ControllerPublishSecretRef != nil {
-			secretKeys = append(secretKeys, fmt.Sprintf("%s/%s",
+			secretKeys = append(secretKeys, graph.NewObjectKey(secretResource,
 				csi.ControllerPublishSecretRef.Namespace, csi.ControllerPublishSecretRef.Name))
 		}
 
 		if csi.NodeStageSecretRef != nil {
-			secretKeys = append(secretKeys, fmt.Sprintf("%s/%s",
+			secretKeys = append(secretKeys, graph.NewObjectKey(secretResource,
 				csi.NodeStageSecretRef.Namespace, csi.NodeStageSecretRef.Name))
 		}
 
 		if csi.NodePublishSecretRef != nil {
-			secretKeys = append(secretKeys, fmt.Sprintf("%s/%s",
+			secretKeys = append(secretKeys, graph.NewObjectKey(secretResource,
 				csi.NodePublishSecretRef.Namespace, csi.NodePublishSecretRef.Name))
 		}
 
 		if csi.ControllerExpandSecretRef != nil {
-			secretKeys = append(secretKeys, fmt.Sprintf("%s/%s",
+			secretKeys = append(secretKeys, graph.NewObjectKey(secretResource,
 				csi.ControllerExpandSecretRef.Namespace, csi.ControllerExpandSecretRef.Name))
 		}
 
@@ -550,8 +613,8 @@ func (c *Controller) getSecretsUsedByPV(pv *v1.PersistentVolume) []string {
 				// so we will miss a chance to queue the secret to remove finalizer.
 				// Current workaround is to queue all the secrets on PVC deletion.
 				klog.Error(err)
-			} else {
-				secretKeys = append(secretKeys, secretKey)
+			} else if secretKey != nil {
+				secretKeys = append(secretKeys, *secretKey)
 			}
 		}
 	}
@@ -559,59 +622,60 @@ func (c *Controller) getSecretsUsedByPV(pv *v1.PersistentVolume) []string {
 	return secretKeys
 }
 
-func (c *Controller) getProvisionerSecretKey(pv *v1.PersistentVolume) (string, error) {
+func (c *Controller) getProvisionerSecretKey(pv *v1.PersistentVolume) (*graph.ObjectKey, error) {
 	var sc *storagev1.StorageClass
 	var pvc *v1.PersistentVolumeClaim
 	var err error
 
 	// No StorageClass name is defined
 	if pv.Spec.StorageClassName == "" {
-		return "", nil
+		return nil, nil
 	}
 	// Get StorageClass for the PV
 	sc, err = c.scLister.Get(pv.Spec.StorageClassName)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Get the template for provisioner secret from StorageClass parameters
 	nsTempl, nameTempl, err := getProvisionerSecretTemplate(sc.Parameters)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	// No valid secret is defined in StorageClass
 	if nsTempl == "" || nameTempl == "" {
-		return "", nil
+		return nil, nil
 	}
 
 	if requirePVC(nsTempl) || requirePVC(nameTempl) {
 		if pv.Spec.ClaimRef == nil {
-			return "", fmt.Errorf("template %q or %q requires information on PVC, but reference to PVC from the PV %q is empty: %v", nsTempl, nameTempl, pv.Name, pv)
+			return nil, fmt.Errorf("template %q or %q requires information on PVC, but reference to PVC from the PV %q is empty: %v", nsTempl, nameTempl, pv.Name, pv)
 		}
 
 		// Get PVC
 		pvc, err = c.pvcLister.PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).Get(pv.Spec.ClaimRef.Name)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 
 	// Resolve namespace for provisioner secret
 	ns, err := c.resolveNamespaceTemplate(nsTempl, pv, pvc)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	// Resolve name for provisioner secret
 	name, err := c.resolveNameTemplate(nameTempl, pv, pvc)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if ns == "" || name == "" {
-		return "", fmt.Errorf("namespace %s or name %s is empty for provisioner secret for PV %s, StorageClass: %v", ns, name, pv.Name, sc)
+		return nil, fmt.Errorf("namespace %s or name %s is empty for provisioner secret for PV %s, StorageClass: %v", ns, name, pv.Name, sc)
 	}
 
-	return fmt.Sprintf("%s/%s", ns, name), nil
+	key := graph.NewObjectKey(secretResource, ns, name)
+	return &key, nil
 }
 
 func (c *Controller) resolveNamespaceTemplate(template string, pv *v1.PersistentVolume, pvc *v1.PersistentVolumeClaim) (string, error) {
@@ -682,10 +746,10 @@ func getProvisionerSecretTemplate(scParams map[string]string) (string, string, e
 	return nsTempl, nameTempl, nil
 }
 
-func (c *Controller) updateLiensForSecret(secret *v1.Secret, resourceID string) error {
-	klog.Errorf("updateLiensForSecret: secret %s/%s: %s", secret.Namespace, secret.Name, resourceID)
+func (c *Controller) addLiensForSecret(secret *v1.Secret) error {
+	klog.Errorf("addLiensForSecret: secret %s/%s", secret.Namespace, secret.Name)
 
-	patch, err := genLiensPatch(secret, resourceID)
+	patch, err := genLiensPatch(secret)
 	if err != nil {
 		return err
 	}
@@ -698,10 +762,10 @@ func (c *Controller) updateLiensForSecret(secret *v1.Secret, resourceID string) 
 	return patchSecretMetadata(c.metadataClient, secret, patch, types.MergePatchType)
 }
 
-func (c *Controller) deleteLiensForSecret(secret *v1.Secret, resourceID string) error {
-	klog.Errorf("deleteLiensForSecret: secret %s/%s: %s", secret.Namespace, secret.Name, resourceID)
+func (c *Controller) deleteLiensForSecret(secret *v1.Secret) error {
+	klog.Errorf("deleteLiensForSecret: secret %s/%s", secret.Namespace, secret.Name)
 
-	patch, err := genDeleteLiensPatch(secret, resourceID)
+	patch, err := genDeleteLiensPatch(secret)
 	if err != nil {
 		return err
 	}
@@ -721,7 +785,7 @@ func patchSecretMetadata(metadataClient metadata.Interface, secret *v1.Secret, p
 	return err
 }
 
-func genLiensPatch(obj runtime.Object, resourceID string) ([]byte, error) {
+func genLiensPatch(obj runtime.Object) ([]byte, error) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return nil, err
@@ -729,12 +793,12 @@ func genLiensPatch(obj runtime.Object, resourceID string) ([]byte, error) {
 
 	newLiens := accessor.GetLiens()
 	for _, lien := range newLiens {
-		if lien == resourceID {
+		if lien == SecretProtectionLienID {
 			// resourceID already exist.
 			return nil, nil
 		}
 	}
-	newLiens = append(newLiens, resourceID)
+	newLiens = append(newLiens, SecretProtectionLienID)
 
 	return json.Marshal(&objectForLiensPatch{
 		ObjectMetaForLiensPatch: ObjectMetaForLiensPatch{
@@ -744,7 +808,7 @@ func genLiensPatch(obj runtime.Object, resourceID string) ([]byte, error) {
 	})
 }
 
-func genDeleteLiensPatch(obj runtime.Object, resourceID string) ([]byte, error) {
+func genDeleteLiensPatch(obj runtime.Object) ([]byte, error) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return nil, err
@@ -753,7 +817,7 @@ func genDeleteLiensPatch(obj runtime.Object, resourceID string) ([]byte, error) 
 	shouldDelete := false
 	newLiens := []string{}
 	for _, lien := range accessor.GetLiens() {
-		if lien == resourceID {
+		if lien == SecretProtectionLienID {
 			shouldDelete = true
 			continue
 		}
@@ -776,15 +840,8 @@ type objectForLiensPatch struct {
 	ObjectMetaForLiensPatch `json:"metadata"`
 }
 
+// ObjectMetaForLiensPatch represents ObjectMeta for Liens patch
 type ObjectMetaForLiensPatch struct {
 	ResourceVersion string   `json:"resourceVersion"`
 	Liens           []string `json:"liens"`
-}
-
-func toPodResourceID(podNamespace, podName string) string {
-	return fmt.Sprintf("%s v1/Pod/%s/%s", SecretProtectionLienID, podNamespace, podName)
-}
-
-func toPvResourceID(pvName string) string {
-	return fmt.Sprintf("%s v1/PersistentVolume//%s", SecretProtectionLienID, pvName)
 }
