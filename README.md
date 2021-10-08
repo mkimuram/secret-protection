@@ -2,7 +2,7 @@
 
 ## Overview
 The secret-protection controller is an external controller that monitors Secret objects and their referencing objects and blocks deletion of Secrets while they are in-use. This feature is being discussd in [KEP-2639](https://github.com/kubernetes/enhancements/pull/2640).
-In this branch, protection logic is experimentally delegated to Lien that is being discussed in [KEP-2839](https://github.com/kubernetes/enhancements/pull/2840) and prototyped [here](https://github.com/mkimuram/kubernetes/commits/lien).
+In this branch, protection logic is experimentally delegated to Lien that is being discussed in [KEP-2839](https://github.com/kubernetes/enhancements/pull/2840) and prototyped [here](https://github.com/mkimuram/kubernetes/commits/lienv2-forcedel).
 
 In Lien, a new field `Liens` is introduced in Object's Metadata as a slice of strings, like `Finalizers`.
 Users or controllers can add/remove the field to ask to block the deletion request of the object.
@@ -10,7 +10,7 @@ The deletion request to an object is blocked by lien validating admission webhoo
 
 By using the Lien, secret-protection controller provides a protection mechanism for secrets.
 It upates the `Liens` field of secrets when it has a referencing object.
-`Liens` field is added/removed per referencing object basis, like `kubernetes.io/secret-protection v1/Pod/default/secret-test-pod`.
+`kubernetes.io/secret-protection` lien is added when the secret is used.
 
 ## Feature status
 This project is still pre-alpha. This is just a prototype for discussion purpose.
@@ -20,15 +20,15 @@ This project is still pre-alpha. This is just a prototype for discussion purpose
 A cluster with Lien is deployed.
 
 ```bash
-git clone --single-branch --depth 5 --branch lien https://github.com/mkimuram/kubernetes.git
+git clone --single-branch --depth 5 --branch lienv2-forcedel https://github.com/mkimuram/kubernetes.git
 cd kubernetes/
-ENABLE_ADMISSION_PLUGINS=Lien hack/local-up-cluster.sh
+FEATURE_GATES=InUseProtection=true hack/local-up-cluster.sh
 ```
 
 ### Build container 
 - Clone this branch
 ```bash
-git clone --single-branch --branch lien https://github.com/mkimuram/secret-protection.git
+git clone --single-branch --branch lienv2 https://github.com/mkimuram/secret-protection.git
 cd secret-protection/
 ```
 
@@ -66,6 +66,8 @@ It should be deleted immediately.
 ```
 kubectl create secret generic test-secret --from-literal='username=my-app' --from-literal='password=39528$vdg7Jb'
 kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+kubectl annotate secrets test-secret kubernetes.io/enable-secret-protection=yes
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
 
 kubectl delete secret test-secret
 ```
@@ -75,10 +77,12 @@ It should block deletion of secret until all pods using the secret are deleted.
 
 ```
 kubectl create secret generic test-secret --from-literal='username=my-app' --from-literal='password=39528$vdg7Jb'
+kubectl annotate secrets test-secret kubernetes.io/enable-secret-protection=yes
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/website/master/content/en/examples/pods/inject/secret-pod.yaml
 kubectl describe pod secret-test-pod
 kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
-[kubernetes.io/secret-protection v1/Pod/default/secret-test-pod]
+[kubernetes.io/secret-protection]
 kubectl delete secret test-secret
 Error from server (Forbidden): secrets "test-secret" is forbidden: deletion not allowed by liens
 kubectl delete pod secret-test-pod
@@ -95,6 +99,7 @@ It should block deletion of secret until all PVs using the secret are deleted.
 
 ```
 kubectl create secret generic test-secret --from-literal='username=my-app' --from-literal='password=39528$vdg7Jb'
+kubectl annotate secrets test-secret kubernetes.io/enable-secret-protection=yes
 
 cat << 'EOF' | kubectl apply -f -
 apiVersion: storage.k8s.io/v1
@@ -130,7 +135,14 @@ kubectl get pv -o yaml | grep -A 5 " csi:"
       volumeAttributes:
 
 kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
-[kubernetes.io/secret-protection v1/PersistentVolume//pvc-b51b463a-fafe-4e78-a11a-b62d670b0916]
+[kubernetes.io/secret-protection]
+
+kubectl annotate secrets test-secret kubernetes.io/enable-secret-protection-
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+
+kubectl annotate secrets test-secret kubernetes.io/enable-secret-protection=yes
+kubectl get secret test-secret -o jsonpath='{.metadata.liens}{"\n"}'
+[kubernetes.io/secret-protection]
 
 kubectl delete secret test-secret
 Error from server (Forbidden): secrets "test-secret" is forbidden: deletion not allowed by liens
